@@ -119,4 +119,71 @@ inline uint16_t f32_to_bf16(float val) {
     return bf16_bits;
 }
 
+inline float fp8_e4m3_to_f32(uint8_t fp8_val) {
+    // FP8 E4M3 格式: 1位符号位 + 4位指数 + 3位尾数
+    uint32_t sign = (fp8_val & 0x80) << 24;      // 提取符号位并移到 FP32 位置
+    uint32_t exponent = (fp8_val >> 3) & 0x0F;   // 提取4位指数
+    uint32_t mantissa = fp8_val & 0x07;          // 提取3位尾数
+    
+    if (exponent == 15) { // 特殊情况：无穷大和 NaN
+        if (mantissa != 0) {
+            // NaN
+            uint32_t f32 = sign | 0x7F800000 | (mantissa << 20);
+            return *(float *)&f32;
+        } else {
+            // 无穷大
+            uint32_t f32 = sign | 0x7F800000;
+            return *(float *)&f32;
+        }
+    } else if (exponent == 0) { // 次正规数或零
+        if (mantissa == 0) {
+            // 零（正零或负零）
+            uint32_t f32 = sign;
+            return *(float *)&f32;
+        } else {
+            // 次正规数：转换为正规化的 FP32
+            int32_t exp = -6;                    // FP8 E4M3 次正规数的指数偏移
+            while ((mantissa & 0x04) == 0) {     // 正规化尾数（寻找隐含的1）
+                mantissa <<= 1;
+                exp--;
+            }
+            mantissa &= 0x03;                    // 清除隐含的1位
+            uint32_t f32 = sign | ((exp + 127) << 23) | (mantissa << 20);
+            return *(float *)&f32;
+        }
+    } else {
+        // 正规化的 FP8 E4M3
+        // FP8 E4M3 指数偏移为7，FP32 指数偏移为127
+        uint32_t f32 = sign | ((exponent + 127 - 7) << 23) | (mantissa << 20);
+        return *(float *)&f32;
+    }
+}
+
+inline uint8_t f32_to_fp8_e4m3(float val) {
+    uint32_t f32;
+    memcpy(&f32, &val, sizeof(f32));               // 读取 FP32 的位表示
+    uint8_t sign = (f32 >> 24) & 0x80;             // 提取符号位
+    int32_t exponent = ((f32 >> 23) & 0xFF) - 127; // 提取并去偏移的指数
+    uint32_t mantissa = f32 & 0x7FFFFF;            // 提取尾数
+    
+    if (exponent >= 8) { // 太大无法表示：返回无穷大或 NaN
+        if (exponent == 128 && mantissa != 0) {
+            // NaN：保持为 NaN
+            return static_cast<uint8_t>(sign | 0x7F);
+        }
+        // 无穷大或溢出：返回无穷大
+        return static_cast<uint8_t>(sign | 0x78);
+    } else if (exponent >= -6) { // 正规化范围
+        // FP8 E4M3 指数偏移为7
+        return static_cast<uint8_t>(sign | ((exponent + 7) << 3) | (mantissa >> 20));
+    } else if (exponent >= -9) { // 次正规数范围
+        mantissa |= 0x800000;                       // 添加隐含的1
+        mantissa >>= (-6 - exponent);               // 右移到次正规数位置
+        return static_cast<uint8_t>(sign | (mantissa >> 20));
+    } else {
+        // 太小无法表示：返回有符号零
+        return static_cast<uint8_t>(sign);
+    }
+}
+
 #endif

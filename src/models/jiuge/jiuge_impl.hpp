@@ -12,6 +12,9 @@
 #include <thread>
 #include <vector>
 
+// 前向声明量化状态结构
+struct QuantizationState;
+
 struct DeviceResource {
     // Device
     infiniDevice_t device;
@@ -28,6 +31,9 @@ struct DeviceResource {
     infinicclComm_t comm;
 
     std::shared_ptr<MemoryPool> memory_pool;
+    
+    // 量化状态（新增）
+    std::shared_ptr<QuantizationState> quant_state;
 };
 
 struct InferState {
