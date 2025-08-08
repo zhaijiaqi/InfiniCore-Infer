@@ -391,9 +391,7 @@ class JiugeBatchedTask:
 
 
 class JiugeForCauslLM:
-    def __init__(
-        self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None
-    ):
+    def __init__(self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None):
         def load_all_safetensors_from_dir(dir_path_: str):
             tensors_ = {}
             dir_path_ = Path(dir_path_)
@@ -524,64 +522,113 @@ class JiugeForCauslLM:
         drop_kv_cache(self.model_instance, kv_cache)
 
     def batch_infer_one_round(self, tasks: List[InferTask]):
+        """
+        执行一轮批量推理
+        
+        参数:
+            tasks: 推理任务列表，每个任务包含输入tokens和采样参数
+            
+        返回:
+            list: 每个任务生成的下一个token ID列表
+        """
+        # 创建用于存储输出结果的C数组，长度等于任务数量
         output = (c_uint * len(tasks))()
+        
+        # 将多个推理任务打包成批量输入格式
         batch_inputs = JiugeBatchedTask(tasks)
+        
+        # 调用底层C接口执行批量推理
+        # model_instance: 模型实例
+        # *batch_inputs.input_args(): 展开批量输入参数（tokens、长度、位置等）
+        # output: 存储每个任务生成的token结果
         infer_batch(
             self.model_instance,
             *(batch_inputs.input_args()),
             output,
         )
+        
+        # 将C数组转换为Python列表并返回
         return list(output)
 
     def generate(self, input_content, max_steps, topp_=1.0, topk_=1, temperature_=1.0):
+        """
+        生成文本的主函数
+        
+        参数:
+            input_content: 用户输入的文本内容
+            max_steps: 最大生成token数量，即模型最多生成多少个新token
+            topp_: top-p采样参数，控制候选词的概率累积阈值
+            topk_: top-k采样参数，选择概率最高的k个词
+            temperature_: 采样温度，控制生成的随机性
+        
+        返回:
+            (output_content, avg_time): 生成的文本内容和平均每步用时
+        """
+        # 使用tokenizer将用户输入格式化为对话模板
         input_content = self.tokenizer.apply_chat_template(
             conversation=[{"role": "user", "content": input_content}],
-            add_generation_prompt=True,
-            tokenize=False,
+            add_generation_prompt=True,  # 添加生成提示符
+            tokenize=False,  # 不进行tokenize，返回字符串
         )
-        print(input_content, end="", flush=True)
+        print(input_content, end="", flush=True)  # 打印输入内容
+        
+        # 将格式化后的文本编码为token序列
         tokens = self.tokenizer.encode(input_content)
+        
+        # 创建推理任务，包含所有必要参数
         infer_task = InferTask(
-            0,
-            tokens,
-            self.max_context_len(),
-            temperature_,
-            topk_,
-            topp_,
-            self.eos_token_id,
+            0,  # 任务ID
+            tokens,  # 输入token序列
+            self.max_context_len(),  # 最大上下文长度
+            temperature_,  # 采样温度
+            topk_,  # top-k参数
+            topp_,  # top-p参数
+            self.eos_token_id,  # 结束token的ID
         )
+        # 为推理任务绑定KV缓存（用于attention计算的优化）
         infer_task.bind_kvcache(KVCache(self))
 
-        steps = 0
-        total_time = 0
-        output_content = ""
+        # 初始化计数器和累积变量
+        steps = 0  # 实际执行的步数
+        total_time = 0  # 总用时（不包括第一步预填充）
+        output_content = ""  # 累积的输出内容
 
+        # 逐步生成token
         for step_i in range(max_steps):
             start_time = time.time()
-            output_tokens = self.batch_infer_one_round([infer_task])
+            # 执行一轮批量推理，获取下一个token
+            output_tokens = self.batch_infer_one_round([infer_task]) # batch_infer_one_round 支持 batch 推理，但这里只传入一个任务
             end_time = time.time()
             steps += 1
+            
+            # 将输出token转换为可读文本
             output_str = (
                 self.tokenizer._tokenizer.id_to_token(output_tokens[0])
-                .replace("▁", " ")
-                .replace("<0x0A>", "\n")
+                .replace("▁", " ")  # 替换特殊空格符号
+                .replace("<0x0A>", "\n")  # 替换换行符
             )
-            output_content += output_str
-            print(output_str, end="", flush=True)
+            output_content += output_str  # 累积输出内容
+            print(output_str, end="", flush=True)  # 实时打印生成的文本
+            
+            # 检查是否生成了结束token
             if output_tokens[0] in self.eos_token_id:
                 break
+            
+            # 将生成的token添加到推理任务中，为下一步推理做准备
             infer_task.next(output_tokens[0])
 
+            # 统计用时（跳过第一步，因为第一步包含预填充时间）
             if step_i > 0:
                 total_time += end_time - start_time
 
-        print("\n")
+        print("\n")  # 生成完成后换行
+        # 计算平均每步用时（毫秒）
         avg_time = total_time * 1000 / (steps - 1)
         print(f"Time per step: {avg_time:.3f}ms")
 
+        # 释放KV缓存资源
         infer_task._kv_cache.drop(self)
         return output_content, avg_time
-
     def destroy_model_instance(self):
         destroy_jiuge_model(self.model_instance)
         print("Model destroyed")
