@@ -1,5 +1,5 @@
 import ctypes
-from ctypes import c_size_t, c_uint, c_int, c_float, c_void_p, POINTER
+from ctypes import c_size_t, c_uint, c_int, c_float, c_void_p, POINTER, c_char_p
 import os
 
 
@@ -59,6 +59,7 @@ class JiugeWeightsCStruct(ctypes.Structure):
         ("nlayer", c_size_t),
         ("dt_norm", DataType),
         ("dt_mat", DataType),
+        ("dt_qkv", DataType),
         ("transpose_linear_weights", c_int),
         ("input_embd", c_void_p),
         ("output_norm", c_void_p),
@@ -103,6 +104,8 @@ def __open_library__():
     lib.createJiugeModel.argtypes = [
         POINTER(JiugeMetaCStruct),  # 模型元数据（层数、维度等）
         POINTER(JiugeWeightsCStruct),  # 模型权重数据
+        c_char_p,  # 模型路径（用于加载量化参数）
+        c_int,  # 是否启用量化
         DeviceType,  # 设备类型（CPU/GPU等）
         c_int,  # 设备数量
         POINTER(c_int),  # 设备ID数组

@@ -60,7 +60,7 @@ struct JiugeModel {
     std::vector<std::thread> threads;
     InferRequest req;
 
-    JiugeModel(const JiugeMeta *, const JiugeWeights *, infiniDevice_t device, std::vector<int> device_ids);
+    JiugeModel(const JiugeMeta *, const JiugeWeights *, infiniDevice_t device, std::vector<int> device_ids, bool enable_quantization);
 };
 
 struct KVCache {

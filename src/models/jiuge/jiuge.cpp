@@ -4,29 +4,140 @@
 #include "../../tensor.hpp"
 #include "../../utils.hpp"
 #include "infinicore_infer.h"
+#include "../../quantization/awq_gemm.hpp"
+#include "../../quantization/awq_quantization_params.hpp"
 
 #include <random>
 #include <thread>
 #include <vector>
 
+// 预加载量化参数的结构体
+struct QuantizationParams {
+    std::vector<awq_gemm::AWQQuantizeParams> awq_params_list;
+    std::vector<std::shared_ptr<Tensor>> weight_scales_list;
+    std::vector<bool> has_quant_params;
+};
+
+// 预加载量化参数的函数
+QuantizationParams preloadQuantizationParams(const JiugeMeta &meta, DeviceResource &rsrc, 
+                                            uint32_t nlayer, bool enable_quantization) {
+    QuantizationParams params;
+    
+    if (enable_quantization && awq_gemm::isAWQGemmSupported(rsrc.device)) {
+        auto* quant_manager = awq_gemm::getQuantizationManager();
+        
+        // 预加载所有层的量化参数
+        for (uint32_t layer = 0; layer < nlayer; layer++) {
+            // 只查找分开的q、k、v权重名称
+            std::string q_weight_name = "model.layers." + std::to_string(layer) + ".self_attn.q_proj.weight";
+            std::string k_weight_name = "model.layers." + std::to_string(layer) + ".self_attn.k_proj.weight";
+            std::string v_weight_name = "model.layers." + std::to_string(layer) + ".self_attn.v_proj.weight";
+
+            // 这里只处理q_proj，后续如需k/v可自行扩展
+            // std::string target_weight_name = q_weight_name;
+
+            std::vector<std::string> target_weight_names = {q_weight_name, k_weight_name, v_weight_name};
+            
+            for (const auto& target_weight_name : target_weight_names) {
+                if (quant_manager && quant_manager->hasParams(target_weight_name)) {
+                    auto awq_params = quant_manager->createAWQParams(target_weight_name);
+                    params.awq_params_list.push_back(awq_params);
+                    params.has_quant_params.push_back(true);
+
+                    // 按层输出scale
+                    std::cout << "[量化参数] 层 " << layer << " 权重: " << target_weight_name
+                              << " scale: ";
+                    if (awq_params.per_channel && !awq_params.group_scales.empty()) {
+                        std::cout << "[";
+                        for (size_t i = 0; i < awq_params.group_scales.size(); ++i) {
+                            std::cout << awq_params.group_scales[i];
+                            if (i != awq_params.group_scales.size() - 1) std::cout << ", ";
+                        }
+                        std::cout << "]";
+                    } else {
+                        std::cout << awq_params.scale << std::endl;
+                    }
+
+                    // 预分配权重缩放因子缓冲区
+                    auto weight_scales = Tensor::buffer(INFINI_DTYPE_F32, {rsrc.w_attn_qkv[layer]->shape()[1]}, rsrc.memory_pool);
+                    params.weight_scales_list.push_back(weight_scales);
+
+                    // 设置缩放因子
+                    auto* scale_data = static_cast<float*>(weight_scales->data());
+                    if (rsrc.device == INFINI_DEVICE_CPU) {
+                        if (awq_params.per_channel && !awq_params.group_scales.empty()) {
+                            std::copy(awq_params.group_scales.begin(), awq_params.group_scales.end(), scale_data);
+                        } else {
+                            std::fill_n(scale_data, weight_scales->shape()[0], awq_params.scale);
+                        }
+                    } else {
+                        std::vector<float> temp_scales;
+                        if (awq_params.per_channel && !awq_params.group_scales.empty()) {
+                            temp_scales = awq_params.group_scales;
+                        } else {
+                            temp_scales.resize(weight_scales->shape()[0], awq_params.scale);
+                        }
+
+                        RUN_INFINI(infinirtMemcpyAsync(scale_data, temp_scales.data(),
+                                                      temp_scales.size() * sizeof(float),
+                                                      INFINIRT_MEMCPY_H2D, rsrc.stream));
+                    }
+                } else {
+                    // 没有量化参数，使用默认参数
+                    auto awq_params = awq_gemm::createAWQParams(nullptr, 128, false);
+                    params.awq_params_list.push_back(awq_params);
+                    params.has_quant_params.push_back(false);
+                    
+                    auto weight_scales = Tensor::buffer(INFINI_DTYPE_F32, {rsrc.w_attn_qkv[layer]->shape()[1]}, rsrc.memory_pool);
+                    params.weight_scales_list.push_back(weight_scales);
+                    
+                    auto* scale_data = static_cast<float*>(weight_scales->data());
+                    if (rsrc.device == INFINI_DEVICE_CPU) {
+                        std::fill_n(scale_data, weight_scales->shape()[0], 1.0f / 127.0f);
+                    } else {
+                        std::vector<float> temp_scales(weight_scales->shape()[0], 1.0f / 127.0f);
+                        RUN_INFINI(infinirtMemcpyAsync(scale_data, temp_scales.data(),
+                                                      temp_scales.size() * sizeof(float),
+                                                      INFINIRT_MEMCPY_H2D, rsrc.stream));
+                    }
+                }
+            }
+        }
+    }
+    
+    return params;
+}
+
 void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
                           const JiugeWeights *weights,
                           infiniDevice_t device, int idev,
                           int ndev, int dev_id,
-                          infinicclComm_t comm) {
+                          infinicclComm_t comm, bool enable_quantization) {
     RUN_INFINI(infinirtSetDevice(device, dev_id));
     infiniopHandle_t handle;
     infiniopCreateHandle(&handle);
     infinirtStream_t stream;
     infinirtStreamCreate(&stream);
 
+    // 先创建内存池，供权重打包使用
+    auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
+
     std::vector<std::shared_ptr<Tensor>> w_attn_norm, w_attn_qkv, b_attn_qkv, w_attn_out,
         w_ffn_norm, w_ffn_gate_up, w_ffn_down;
     for (size_t layer = 0; layer < meta->nlayer; layer++) {
         w_attn_norm.push_back(
             getAttnNorm(meta, weights, layer));
+        
+        // 在量化模式下使用4字节打包的权重
+        if (enable_quantization && awq_gemm::isAWQGemmSupported(device)) {
+            std::cout << "[权重打包] 层 " << layer << " 使用4字节打包INT8权重" << std::endl;
+            w_attn_qkv.push_back(
+                getAttnQKVPacked4Byte(meta, weights, layer, idev, ndev, memory_pool));
+        } else {
         w_attn_qkv.push_back(
             getAttnQKV(meta, weights, layer, idev, ndev));
+        }
+        
         if (weights->attn_qkv_b != nullptr) {
             b_attn_qkv.push_back(
                 getAttnQKVBias(meta, weights, layer, idev, ndev));
@@ -40,8 +151,6 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
         w_ffn_down.push_back(
             getFFNDown(meta, weights, layer, idev, ndev));
     }
-
-    auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
 
     *rsrc = DeviceResource{
         device,
@@ -116,7 +225,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                       const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
-                      uint32_t *output) {
+                      uint32_t *output, bool enable_quantization, const QuantizationParams &quant_params) {
     auto nlayer = meta.nlayer;
     auto nkvh = meta.nkvh / ndev;
     auto nh = meta.nh / ndev;
@@ -177,19 +286,24 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     // Attention
     infiniopGemmDescriptor_t desc_attn_qkv, desc_attn_o;
     infiniopRearrangeDescriptor_t desc_qkv_bias;
+    bool use_awq = enable_quantization && awq_gemm::isAWQGemmSupported(rsrc.device);
     if (has_qkv_bias) {
         RUN_INFINI(infiniopCreateRearrangeDescriptor(
             rsrc.handle, &desc_qkv_bias, qkv_buf->desc(),
             TensorDesc::create(dt_logits, {ntok, (nh + nkvh * 2) * dh}, {0, 1})->desc()));
     }
-    RUN_INFINI(infiniopCreateGemmDescriptor(
-        rsrc.handle, &desc_attn_qkv, qkv_buf->desc(),
-        logits_in->desc(), rsrc.w_attn_qkv[0]->desc()));
+    if (!use_awq) {
+        RUN_INFINI(infiniopCreateGemmDescriptor(
+            rsrc.handle, &desc_attn_qkv, qkv_buf->desc(),
+            logits_in->desc(), rsrc.w_attn_qkv[0]->desc()));
+    }
     RUN_INFINI(infiniopCreateGemmDescriptor(
         rsrc.handle, &desc_attn_o, logits_in->desc(),
         o_buf->desc(), rsrc.w_attn_out[0]->desc()));
-    RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_qkv, &temp_size));
-    workspace_size = std::max(workspace_size, temp_size);
+    if (!use_awq) {
+        RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_qkv, &temp_size));
+        workspace_size = std::max(workspace_size, temp_size);
+    }
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_o, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
     infiniopRoPEDescriptor_t desc_rope_q, desc_rope_k;
@@ -237,7 +351,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
 
         // [nkvh, ngroup, seq_len, dh]
         q->dimSplit(1, {nkvh, ngroup})->permute({1, 2, 0, 3});
-        auto q_t = TensorDesc::create(dt_logits, {nkvh, ngroup, seq_len, dh});
+        auto q_t = TensorDesc::create(dt_logits, std::vector<size_t>{nkvh, ngroup, seq_len, dh});
         // [seq_len, nkvh, ngroup, dh] -> [nkvh, ngroup, seq_len, dh]
         RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_q_rearranges[req],
                                                      q_t->desc(), q->desc()));
@@ -246,8 +360,8 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         auto attn_v = TensorDesc::createWithOrder(dt_logits, {nkvh, ngroup, seq_len, dh}, {1, 2, 0, 3});
         RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_attn_v_rearranges[req],
                                                      attn_v->desc(), attn_v_t->desc()));
-        q_t = TensorDesc::create(dt_logits, {nkvh, ngroup * seq_len, dh});
-        auto qk = TensorDesc::create(dt_logits, {nkvh, ngroup * seq_len, total_len});
+        q_t = TensorDesc::create(dt_logits, std::vector<size_t>{nkvh, ngroup * seq_len, dh});
+        auto qk = TensorDesc::create(dt_logits, std::vector<size_t>{nkvh, ngroup * seq_len, total_len});
         max_qk_size = std::max(max_qk_size, size_t(seq_len * total_len));
         max_seq_len = std::max(max_seq_len, size_t(seq_len));
         RUN_INFINI(infiniopCreateGemmDescriptor(
@@ -262,7 +376,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_v_gemms[req], &temp_size));
         workspace_size = std::max(workspace_size, temp_size);
 
-        qk = TensorDesc::create(dt_logits, {nkvh * ngroup, seq_len, total_len});
+        qk = TensorDesc::create(dt_logits, std::vector<size_t>{nkvh * ngroup, seq_len, total_len});
         RUN_INFINI(infiniopCreateCausalSoftmaxDescriptor(
             rsrc.handle, &desc_qk_softmaxs[req], qk->desc(), qk->desc()));
         RUN_INFINI(infiniopGetCausalSoftmaxWorkspaceSize(desc_qk_softmaxs[req], &temp_size));
@@ -323,21 +437,40 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     // Compute
     for (uint32_t layer = 0; layer < nlayer; layer++) {
         // 1. Attention
-        // rms norm
+        // rms norm (不适合量化，保持高精度)
+        
         RUN_INFINI(infiniopRMSNorm(
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
             rsrc.w_attn_norm[layer]->data(), stream));
         // qkv_proj
+        // [量化执行点1] 使用融合的量化+GEMM操作
+        // 这样可以避免GPU内存的显式量化操作，直接在GEMM kernel中完成
+
+        // 在两种路径中都预填充bias（当存在bias时，后续GEMM用beta=1累加）
         if (has_qkv_bias) {
             RUN_INFINI(infiniopRearrange(
                 desc_qkv_bias,
                 qkv_buf->data(), rsrc.b_attn_qkv[layer]->data(), stream));
         }
-        RUN_INFINI(infiniopGemm(
-            desc_attn_qkv, workspace, workspace_size,
-            qkv_buf->data(), logits_out->data(),
-            rsrc.w_attn_qkv[layer]->data(), 1.0, has_qkv_bias ? 1.0 : 0.0, stream));
+
+        // 检查是否支持量化GEMM并且启用了量化
+        if (!use_awq) {
+            RUN_INFINI(infiniopGemm(
+                desc_attn_qkv, workspace, workspace_size,
+                qkv_buf->data(), logits_out->data(),
+                rsrc.w_attn_qkv[layer]->data(), 1.0, has_qkv_bias ? 1.0 : 0.0, stream));
+        } else {
+            // 使用AWQ量化GEMM（内部使用AWQDescriptor）
+            auto awq_params = awq_gemm::createAWQParams(logits_out, 128, false);
+            auto weight_scales = quant_params.weight_scales_list[layer];
+
+            RUN_INFINI(awq_gemm::awqQuantizedGemm(
+                rsrc.handle, qkv_buf, logits_out, rsrc.w_attn_qkv[layer],
+                weight_scales, awq_params, 1.0f, has_qkv_bias ? 1.0f : 0.0f, stream));
+        }
+        // AWQ GEMM已经输出了正确格式的数据，不需要额外的反量化步骤
+        
         // rope
         RUN_INFINI(infiniopRoPE(
             desc_rope_q, workspace, workspace_size,
@@ -363,6 +496,8 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
             // self attention
             // concat
+            // [量化执行点2] KV Cache存储时的量化/使用时的反量化
+            // 若KV Cache已量化存储，此处需要在写入时量化，读取时反量化
             RUN_INFINI(infiniopRearrange(
                 desc_kv_rearranges[req],
                 kv_caches[req]->k[idev][layer]->data(past_len * nkvh * dh),
@@ -393,6 +528,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             token_offset += seq_len;
         }
         // o_proj
+        // [量化执行点3] Attention输出投影的量化GEMM计算
         RUN_INFINI(infiniopGemm(
             desc_attn_o, workspace, workspace_size,
             logits_in->data(), o_buf->data(),
@@ -406,23 +542,28 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
         // 2. FFN
-        // rms_norm
+        // rms_norm (不适合量化，保持高精度)
         RUN_INFINI(infiniopRMSNorm(
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
             rsrc.w_ffn_norm[layer]->data(), stream));
+        // [量化执行点4] FFN Gate/Up投影的量化GEMM计算
+        // quant
         RUN_INFINI(infiniopGemm(
             desc_ffn_gate_up, workspace, workspace_size,
             gate_up_buf->data(), logits_out->data(), rsrc.w_ffn_gate_up[layer]->data(),
             1.0, 0.0, stream));
+        // dequant
         RUN_INFINI(infiniopSwiGLU(
             desc_swiglu, workspace, workspace_size,
             gate_buf->data(), up_buf->data(), gate_buf->data(), stream));
+        // quant
+        // [量化执行点4] FFN Down投影的量化GEMM计算
         RUN_INFINI(infiniopGemm(
             desc_ffn_down, workspace, workspace_size,
             logits_in->data(), gate_buf->data(),
             rsrc.w_ffn_down[layer]->data(), 1.0, idev == 0 ? 1.0 : 0.0, stream)); // only rank 0 adds residual
-
+        // dequant
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
             RUN_INFINI(infinicclAllReduce(
@@ -437,12 +578,15 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         for (uint32_t req = 0; req < nreq; req++) {
             auto seq_len = req_lens[req];
             token_offset += seq_len;
+            // 输出归一化 (不适合量化，保持高精度)
             RUN_INFINI(infiniopRMSNorm(
                 desc_norm_out, workspace, workspace_size,
                 logits_out->data(req * d),
                 logits_in->data((token_offset - 1) * d),
                 rsrc.w_out_norm->data(), stream));
         }
+        // [量化执行点6] 输出Embedding的量化GEMM计算
+        // 这是最后一层的logits计算，量化精度会直接影响生成质量
         RUN_INFINI(infiniopGemm(
             desc_out_embd, workspace, workspace_size,
             prob_buf->data(), logits_out->data(),
@@ -472,29 +616,31 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         }
     }
 
-    // Clean up
-    infiniopDestroyRMSNormDescriptor(desc_norm);
-    if (has_qkv_bias) {
-        infiniopDestroyRearrangeDescriptor(desc_qkv_bias);
-    }
-    infiniopDestroyGemmDescriptor(desc_attn_qkv);
-    infiniopDestroyGemmDescriptor(desc_attn_o);
-    infiniopDestroyRoPEDescriptor(desc_rope_q);
-    infiniopDestroyRoPEDescriptor(desc_rope_k);
-    for (uint32_t req = 0; req < nreq; req++) {
-        infiniopDestroyRearrangeDescriptor(desc_kv_rearranges[req]);
-        infiniopDestroyRearrangeDescriptor(desc_q_rearranges[req]);
-        infiniopDestroyGemmDescriptor(desc_qk_gemms[req]);
-        infiniopDestroyCausalSoftmaxDescriptor(desc_qk_softmaxs[req]);
-        infiniopDestroyGemmDescriptor(desc_attn_v_gemms[req]);
-        infiniopDestroyRearrangeDescriptor(desc_attn_v_rearranges[req]);
-    }
-    infiniopDestroyGemmDescriptor(desc_ffn_gate_up);
-    infiniopDestroySwiGLUDescriptor(desc_swiglu);
-    infiniopDestroyGemmDescriptor(desc_ffn_down);
-    infiniopDestroyRMSNormDescriptor(desc_norm_out);
-    infiniopDestroyGemmDescriptor(desc_out_embd);
-    infiniopDestroyRandomSampleDescriptor(desc_sample);
+	// Clean up
+	infiniopDestroyRMSNormDescriptor(desc_norm);
+	if (has_qkv_bias) {
+		infiniopDestroyRearrangeDescriptor(desc_qkv_bias);
+	}
+	if (!use_awq) {
+		infiniopDestroyGemmDescriptor(desc_attn_qkv);
+	}
+	infiniopDestroyGemmDescriptor(desc_attn_o);
+	infiniopDestroyRoPEDescriptor(desc_rope_q);
+	infiniopDestroyRoPEDescriptor(desc_rope_k);
+	for (uint32_t req = 0; req < nreq; req++) {
+		infiniopDestroyRearrangeDescriptor(desc_kv_rearranges[req]);
+		infiniopDestroyRearrangeDescriptor(desc_q_rearranges[req]);
+		infiniopDestroyGemmDescriptor(desc_qk_gemms[req]);
+		infiniopDestroyCausalSoftmaxDescriptor(desc_qk_softmaxs[req]);
+		infiniopDestroyGemmDescriptor(desc_attn_v_gemms[req]);
+		infiniopDestroyRearrangeDescriptor(desc_attn_v_rearranges[req]);
+	}
+	infiniopDestroyGemmDescriptor(desc_ffn_gate_up);
+	infiniopDestroySwiGLUDescriptor(desc_swiglu);
+	infiniopDestroyGemmDescriptor(desc_ffn_down);
+	infiniopDestroyRMSNormDescriptor(desc_norm_out);
+	infiniopDestroyGemmDescriptor(desc_out_embd);
+	infiniopDestroyRandomSampleDescriptor(desc_sample);
 }
 
 __C void
@@ -530,9 +676,16 @@ inferBatch(struct JiugeModel *model,
 }
 
 void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceResource *rsrc, InferState &state, InferRequest &req,
-                  infiniDevice_t device, int idev, int ndev, int dev_id, infinicclComm_t comm) {
+                  infiniDevice_t device, int idev, int ndev, int dev_id, infinicclComm_t comm, bool enable_quantization) {
     // Create Device Resource
-    createDeviceResource(rsrc, &meta, weights, device, idev, ndev, dev_id, comm);
+    createDeviceResource(rsrc, &meta, weights, device, idev, ndev, dev_id, comm, enable_quantization);
+    
+    // 预加载量化参数（只在设备资源创建后执行一次）
+    QuantizationParams quant_params;
+    if (enable_quantization) {
+        quant_params = preloadQuantizationParams(meta, *rsrc, meta.nlayer, enable_quantization);
+    }
+    
     {
         std::unique_lock<std::mutex> lock(state.mtx);
         state.loaded = true;
@@ -549,7 +702,7 @@ void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceReso
             break;
         }
 
-        inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.temperature, req.topk, req.topp, req.output);
+        inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.temperature, req.topk, req.topp, req.output, enable_quantization, quant_params);
 
         state.proceed = false;
         lock.unlock();
@@ -560,7 +713,7 @@ void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceReso
     releaseDeviceResource(*rsrc);
 }
 
-JiugeModel::JiugeModel(const JiugeMeta *_meta, const JiugeWeights *weights, infiniDevice_t device_, std::vector<int> device_ids) : meta(*_meta) {
+JiugeModel::JiugeModel(const JiugeMeta *_meta, const JiugeWeights *weights, infiniDevice_t device_, std::vector<int> device_ids, bool enable_quantization) : meta(*_meta) {
     int ndev = int(device_ids.size());
     device = device_;
     dev_ids = device_ids;
@@ -574,7 +727,7 @@ JiugeModel::JiugeModel(const JiugeMeta *_meta, const JiugeWeights *weights, infi
     }
 
     for (int i = 0; i < ndev; i++) {
-        threads[i] = std::thread(launchDevice, std::cref(meta), weights, &dev_resources[i], std::ref(states[i]), std::ref(req), device, i, ndev, dev_ids[i], comms[i]);
+        threads[i] = std::thread(launchDevice, std::cref(meta), weights, &dev_resources[i], std::ref(states[i]), std::ref(req), device, i, ndev, dev_ids[i], comms[i], enable_quantization);
     }
     for (int i = 0; i < ndev; i++) {
         std::unique_lock<std::mutex> lock(states[i].mtx);
@@ -586,12 +739,20 @@ JiugeModel::JiugeModel(const JiugeMeta *_meta, const JiugeWeights *weights, infi
 __C struct JiugeModel *
 createJiugeModel(const JiugeMeta *meta,
                  const JiugeWeights *weights,
+                 const char *model_path,
+                 int enable_quantization,
                  infiniDevice_t device,
                  int ndev,
                  const int *dev_ids) {
+    
+    // 只有在启用量化时才初始化量化参数管理器
+    if (enable_quantization && model_path != nullptr) {
+        awq_gemm::initializeQuantizationManager(model_path);
+    }
+    
     std::vector<int> device_ids(ndev);
     std::copy(dev_ids, dev_ids + ndev, device_ids.begin());
-    JiugeModel *model = new JiugeModel(meta, weights, device, device_ids);
+    JiugeModel *model = new JiugeModel(meta, weights, device, device_ids, enable_quantization);
     return model;
 }
 

@@ -20,7 +20,7 @@ typedef struct
 typedef struct
 {
     size_t nlayer;
-    infiniDtype_t dt_norm, dt_mat;
+    infiniDtype_t dt_norm, dt_mat, dt_qkv;
     // 0 if linear weights are passed as W, any other value if passed as W^T (default format in pytorch)
     int transpose_linear_weights;
     // [dvoc, d]
@@ -47,12 +47,18 @@ typedef struct
 
 //////////////////// APIs ///////////////////////
 /// @brief 创建模型
+/// @param meta 模型元数据
+/// @param weights 模型权重
+/// @param model_path 模型路径（用于加载量化参数）
+/// @param enable_quantization 是否启用量化
 /// @param device 协处理器种类
 /// @param ndev 协处理器数量
 /// @param dev_ids 协处理器编号，长度为 ndev
 __C __export struct JiugeModel *
 createJiugeModel(const JiugeMeta *,
                  const JiugeWeights *,
+                 const char *model_path,
+                 int enable_quantization,
                  infiniDevice_t device,
                  int ndev,
                  const int *dev_ids);

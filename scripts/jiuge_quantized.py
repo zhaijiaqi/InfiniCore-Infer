@@ -1100,6 +1100,7 @@ class JiugeOptimizedForCauslLM:
         self.model_instance = create_jiuge_model(
             byref(self.meta),
             byref(self.weights),
+            model_dir_path.encode('utf-8'),  # 传递模型路径
             device,
             ndev,
             dev_ids,
