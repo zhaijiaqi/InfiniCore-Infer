@@ -13,7 +13,7 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
                           const JiugeWeights *weights,
                           infiniDevice_t device, int idev,
                           int ndev, int dev_id,
-                          infinicclComm_t comm) {
+                          infinicclComm_t comm, bool enable_quantization) {
     RUN_INFINI(infinirtSetDevice(device, dev_id));
     infiniopHandle_t handle;
     infiniopCreateHandle(&handle);
@@ -530,9 +530,9 @@ inferBatch(struct JiugeModel *model,
 }
 
 void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceResource *rsrc, InferState &state, InferRequest &req,
-                  infiniDevice_t device, int idev, int ndev, int dev_id, infinicclComm_t comm) {
+                  infiniDevice_t device, int idev, int ndev, int dev_id, infinicclComm_t comm, bool enable_quantization) {
     // Create Device Resource
-    createDeviceResource(rsrc, &meta, weights, device, idev, ndev, dev_id, comm);
+    createDeviceResource(rsrc, &meta, weights, device, idev, ndev, dev_id, comm, enable_quantization);
     {
         std::unique_lock<std::mutex> lock(state.mtx);
         state.loaded = true;
@@ -560,7 +560,7 @@ void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceReso
     releaseDeviceResource(*rsrc);
 }
 
-JiugeModel::JiugeModel(const JiugeMeta *_meta, const JiugeWeights *weights, infiniDevice_t device_, std::vector<int> device_ids) : meta(*_meta) {
+JiugeModel::JiugeModel(const JiugeMeta *_meta, const JiugeWeights *weights, infiniDevice_t device_, std::vector<int> device_ids, bool enable_quantization) : meta(*_meta) {
     int ndev = int(device_ids.size());
     device = device_;
     dev_ids = device_ids;
@@ -574,7 +574,7 @@ JiugeModel::JiugeModel(const JiugeMeta *_meta, const JiugeWeights *weights, infi
     }
 
     for (int i = 0; i < ndev; i++) {
-        threads[i] = std::thread(launchDevice, std::cref(meta), weights, &dev_resources[i], std::ref(states[i]), std::ref(req), device, i, ndev, dev_ids[i], comms[i]);
+        threads[i] = std::thread(launchDevice, std::cref(meta), weights, &dev_resources[i], std::ref(states[i]), std::ref(req), device, i, ndev, dev_ids[i], comms[i], enable_quantization);
     }
     for (int i = 0; i < ndev; i++) {
         std::unique_lock<std::mutex> lock(states[i].mtx);
@@ -586,12 +586,14 @@ JiugeModel::JiugeModel(const JiugeMeta *_meta, const JiugeWeights *weights, infi
 __C struct JiugeModel *
 createJiugeModel(const JiugeMeta *meta,
                  const JiugeWeights *weights,
+                 const char *model_path,
+                 bool enable_quantization,
                  infiniDevice_t device,
                  int ndev,
                  const int *dev_ids) {
     std::vector<int> device_ids(ndev);
     std::copy(dev_ids, dev_ids + ndev, device_ids.begin());
-    JiugeModel *model = new JiugeModel(meta, weights, device, device_ids);
+    JiugeModel *model = new JiugeModel(meta, weights, device, device_ids, enable_quantization);
     return model;
 }
 

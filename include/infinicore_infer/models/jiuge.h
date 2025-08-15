@@ -20,7 +20,7 @@ typedef struct
 typedef struct
 {
     size_t nlayer;
-    infiniDtype_t dt_norm, dt_mat;
+    infiniDtype_t dt_norm, dt_mat, dt_qkv;
     // 0 if linear weights are passed as W, any other value if passed as W^T (default format in pytorch)
     int transpose_linear_weights;
     // [dvoc, d]
@@ -53,6 +53,8 @@ typedef struct
 __C __export struct JiugeModel *
 createJiugeModel(const JiugeMeta *,
                  const JiugeWeights *,
+                 const char *model_path,
+                 bool enable_quantization,
                  infiniDevice_t device,
                  int ndev,
                  const int *dev_ids);

@@ -13,7 +13,7 @@ from libinfinicore_infer import (
 )
 from infer_task import InferTask, KVCache
 
-from ctypes import POINTER, c_float, c_int, c_uint, c_void_p, byref
+from ctypes import POINTER, c_float, c_int, c_uint, c_void_p, byref, c_bool
 import os
 from pathlib import Path
 import safetensors
@@ -82,7 +82,9 @@ class LlamaWeightsNaming:
 
 class JiugeMetaFromLlama(JiugeMetaCStruct):
     def __init__(self, config, dtype=torch.float16, max_tokens=None):
-        if dtype == torch.float16:
+        if dtype == torch.int8:
+            dt_ = DataType.INFINI_DTYPE_I8
+        elif dtype == torch.float16:
             dt_ = DataType.INFINI_DTYPE_F16
         elif dtype == torch.float32:
             dt_ = DataType.INFINI_DTYPE_F32
@@ -139,6 +141,7 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         meta,
         naming,
         state_dict,
+        torch_dt_qkv=torch.float16,
         torch_dt_mat=torch.float16,
         torch_dt_norm=torch.float32,
         ndev=1,
@@ -159,7 +162,9 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         assert nkvh % ndev == 0
         assert di % ndev == 0
         torch_dt_logits = meta.torch_dtype_logits
-        if torch_dt_mat == torch.float16:
+        if torch_dt_mat == torch.int8:
+            self.dt_mat = DataType.INFINI_DTYPE_I8
+        elif torch_dt_mat == torch.float16:
             self.dt_mat = DataType.INFINI_DTYPE_F16
         elif torch_dt_mat == torch.float32:
             self.dt_mat = DataType.INFINI_DTYPE_F32
@@ -167,7 +172,9 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
             self.dt_mat = DataType.INFINI_DTYPE_BF16
         else:
             raise ValueError("Unsupported proj weight data type")
-        if torch_dt_norm == torch.float16:
+        if torch_dt_norm == torch.int8:
+            self.dt_norm = DataType.INFINI_DTYPE_I8
+        elif torch_dt_norm == torch.float16:
             self.dt_norm = DataType.INFINI_DTYPE_F16
         elif torch_dt_norm == torch.float32:
             self.dt_norm = DataType.INFINI_DTYPE_F32
@@ -175,6 +182,16 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
             self.dt_norm = DataType.INFINI_DTYPE_BF16
         else:
             raise ValueError("Unsupported norm weight data type")
+        if torch_dt_qkv == torch.int8:
+            self.dt_qkv = DataType.INFINI_DTYPE_I8
+        elif torch_dt_qkv == torch.float16:
+            self.dt_qkv = DataType.INFINI_DTYPE_F16
+        elif torch_dt_qkv == torch.float32:
+            self.dt_qkv = DataType.INFINI_DTYPE_F32
+        elif torch_dt_qkv == torch.bfloat16:
+            self.dt_qkv = DataType.INFINI_DTYPE_BF16
+        else:
+            raise ValueError("Unsupported qkv weight data type")
 
         input_embd_naming = (
             naming.input_embd()
@@ -233,7 +250,7 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
             return _result
 
         self.qkv_tensor = [
-            torch.concat(qkv_slices(i)).to(torch_dt_mat) for i in range(nlayer)
+            torch.concat(qkv_slices(i)).to(torch_dt_qkv) for i in range(nlayer)
         ]
         if not transpose_weight:
             for i in range(nlayer):
@@ -392,7 +409,7 @@ class JiugeBatchedTask:
 
 class JiugeForCauslLM:
     def __init__(
-        self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None
+        self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None, enable_quantization=False
     ):
         def load_all_safetensors_from_dir(dir_path_: str):
             tensors_ = {}
@@ -469,10 +486,21 @@ class JiugeForCauslLM:
                 )
             if LlamaWeightsNaming.match(state_dict):
                 self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
+                attn_q_key = None
+                for key in state_dict.keys():
+                    if "q_proj.weight" in key:
+                        attn_q_key = key
+                        break
+                if attn_q_key is not None:
+                    torch_dt_qkv = state_dict[attn_q_key].dtype
+                else:
+                    torch_dt_qkv = torch.float16
+
                 self.weights = JiugeWeightsImpl(
                     self.meta,
                     LlamaWeightsNaming(),
                     state_dict,
+                    torch_dt_qkv=torch_dt_qkv,
                     ndev=ndev,
                     transpose_weight=transpose_weight,
                 )
@@ -507,6 +535,8 @@ class JiugeForCauslLM:
         self.model_instance = create_jiuge_model(
             byref(self.meta),
             byref(self.weights),
+            model_dir_path.encode('utf-8'),
+            c_bool(True) if enable_quantization else c_bool(False),
             device,
             ndev,
             dev_ids,
@@ -590,7 +620,7 @@ class JiugeForCauslLM:
 def test():
     if len(sys.argv) < 3:
         print(
-            "Usage: python jiuge.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
+            "Usage: python jiuge.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device] [--quantization]"
         )
         sys.exit(1)
     model_path = sys.argv[2]
@@ -611,12 +641,13 @@ def test():
         device_type = DeviceType.DEVICE_TYPE_ILUVATAR
     else:
         print(
-            "Usage: python jiuge.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
+            "Usage: python jiuge.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device] [--quantization]"
         )
         sys.exit(1)
 
     ndev = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-    model = JiugeForCauslLM(model_path, device_type, ndev)
+    enable_quantization = "--quantization" in sys.argv
+    model = JiugeForCauslLM(model_path, device_type, ndev, enable_quantization=enable_quantization)
     model.generate("山东最高的山是？", 500)
     model.destroy_model_instance()
 

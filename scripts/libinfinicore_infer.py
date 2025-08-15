@@ -1,5 +1,5 @@
 import ctypes
-from ctypes import c_size_t, c_uint, c_int, c_float, c_void_p, POINTER
+from ctypes import c_size_t, c_uint, c_int, c_float, c_void_p, POINTER, c_char_p, c_bool
 import os
 
 
@@ -59,6 +59,7 @@ class JiugeWeightsCStruct(ctypes.Structure):
         ("nlayer", c_size_t),
         ("dt_norm", DataType),
         ("dt_mat", DataType),
+        ("dt_qkv", DataType),
         ("transpose_linear_weights", c_int),
         ("input_embd", c_void_p),
         ("output_norm", c_void_p),
@@ -90,6 +91,8 @@ def __open_library__():
     lib.createJiugeModel.argtypes = [
         POINTER(JiugeMetaCStruct),  # JiugeMeta const *
         POINTER(JiugeWeightsCStruct),  # JiugeWeights const *
+        c_char_p,
+        c_bool,
         DeviceType,  # DeviceType
         c_int,  # int ndev
         POINTER(c_int),  # int const *dev_ids
