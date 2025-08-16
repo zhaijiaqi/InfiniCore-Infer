@@ -4,10 +4,98 @@
 #include "../../tensor.hpp"
 #include "../../utils.hpp"
 #include "infinicore_infer.h"
+#include "../../quantization/awq_gemm.hpp"
+#include "../../quantization/awq_quantization_params.hpp"
 
 #include <random>
 #include <thread>
 #include <vector>
+
+// 预加载量化参数的结构体
+struct QuantizationParams {
+    std::vector<awq_gemm::AWQQuantizeParams> awq_params_list;
+    std::vector<std::shared_ptr<Tensor>> weight_scales_list;
+    std::vector<bool> has_quant_params;
+};
+
+// 预加载量化参数的函数
+QuantizationParams preloadQuantizationParams(const JiugeMeta &meta, DeviceResource &rsrc,
+                                            uint32_t nlayer, bool enable_quantization) {
+    QuantizationParams params;
+    if (enable_quantization && awq_gemm::isAWQGemmSupported(rsrc.device)) {
+        auto* quant_manager = awq_gemm::getQuantizationManager();
+        // 预加载所有层的量化参数
+        for (uint32_t layer = 0; layer < nlayer; layer++) {
+            // 只查找分开的q、k、v权重名称
+            std::string q_weight_name = "model.layers." + std::to_string(layer) + ".self_attn.q_proj.weight";
+            std::string k_weight_name = "model.layers." + std::to_string(layer) + ".self_attn.k_proj.weight";
+            std::string v_weight_name = "model.layers." + std::to_string(layer) + ".self_attn.v_proj.weight";
+            // 这里只处理q_proj，后续如需k/v可自行扩展
+            // std::string target_weight_name = q_weight_name;
+            std::vector<std::string> target_weight_names = {q_weight_name, k_weight_name, v_weight_name};
+            for (const auto& target_weight_name : target_weight_names) {
+                if (quant_manager && quant_manager->hasParams(target_weight_name)) {
+                    auto awq_params = quant_manager->createAWQParams(target_weight_name);
+                    params.awq_params_list.push_back(awq_params);
+                    params.has_quant_params.push_back(true);
+                    // 按层输出scale
+                    std::cout << "[量化参数] 层 " << layer << " 权重: " << target_weight_name
+                              << " scale: ";
+                    if (awq_params.per_channel && !awq_params.group_scales.empty()) {
+                        std::cout << "[";
+                        for (size_t i = 0; i < awq_params.group_scales.size(); ++i) {
+                            std::cout << awq_params.group_scales[i];
+                            if (i != awq_params.group_scales.size() - 1) std::cout << ", ";
+                        }
+                        std::cout << "]";
+                    } else {
+                        std::cout << awq_params.scale << std::endl;
+                    }
+                    // 预分配权重缩放因子缓冲区
+                    auto weight_scales = Tensor::buffer(INFINI_DTYPE_F32, {rsrc.w_attn_qkv[layer]->shape()[1]}, rsrc.memory_pool);
+                    params.weight_scales_list.push_back(weight_scales);
+                    // 设置缩放因子
+                    auto* scale_data = static_cast<float*>(weight_scales->data());
+                    if (rsrc.device == INFINI_DEVICE_CPU) {
+                        if (awq_params.per_channel && !awq_params.group_scales.empty()) {
+                            std::copy(awq_params.group_scales.begin(), awq_params.group_scales.end(), scale_data);
+                        } else {
+                            std::fill_n(scale_data, weight_scales->shape()[0], awq_params.scale);
+                        }
+                    } else {
+                        std::vector<float> temp_scales;
+                        if (awq_params.per_channel && !awq_params.group_scales.empty()) {
+                            temp_scales = awq_params.group_scales;
+                        } else {
+                            temp_scales.resize(weight_scales->shape()[0], awq_params.scale);
+                        }
+                        RUN_INFINI(infinirtMemcpyAsync(scale_data, temp_scales.data(),
+                                                      temp_scales.size() * sizeof(float),
+                                                      INFINIRT_MEMCPY_H2D, rsrc.stream));
+                    }
+                } else {
+                    // 没有量化参数，使用默认参数
+                    auto awq_params = awq_gemm::createAWQParams(nullptr, 128, false);
+                    params.awq_params_list.push_back(awq_params);
+                    params.has_quant_params.push_back(false);
+                    auto weight_scales = Tensor::buffer(INFINI_DTYPE_F32, {rsrc.w_attn_qkv[layer]->shape()[1]}, rsrc.memory_pool);
+                    params.weight_scales_list.push_back(weight_scales);
+                    auto* scale_data = static_cast<float*>(weight_scales->data());
+                    if (rsrc.device == INFINI_DEVICE_CPU) {
+                        std::fill_n(scale_data, weight_scales->shape()[0], 1.0f / 127.0f);
+                    } else {
+                        std::vector<float> temp_scales(weight_scales->shape()[0], 1.0f / 127.0f);
+                        RUN_INFINI(infinirtMemcpyAsync(scale_data, temp_scales.data(),
+                                                      temp_scales.size() * sizeof(float),
+                                                      INFINIRT_MEMCPY_H2D, rsrc.stream));
+                    }
+                }
+            }
+        }
+    }
+    return params;
+}
+
 
 void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
                           const JiugeWeights *weights,
@@ -20,13 +108,22 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
     infinirtStream_t stream;
     infinirtStreamCreate(&stream);
 
+    auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
+
     std::vector<std::shared_ptr<Tensor>> w_attn_norm, w_attn_qkv, b_attn_qkv, w_attn_out,
         w_ffn_norm, w_ffn_gate_up, w_ffn_down;
     for (size_t layer = 0; layer < meta->nlayer; layer++) {
         w_attn_norm.push_back(
             getAttnNorm(meta, weights, layer));
-        w_attn_qkv.push_back(
-            getAttnQKV(meta, weights, layer, idev, ndev));
+        if (enable_quantization && awq_gemm::isAWQGemmSupported(device)) {
+            std::cout << "[pack] layer " << layer << std::endl;
+            w_attn_qkv.push_back(
+                getAttnQKVPacked4Byte(meta, weights, layer, idev, ndev, memory_pool)
+            );
+        } else {
+            w_attn_qkv.push_back(
+                getAttnQKV(meta, weights, layer, idev, ndev));
+        }
         if (weights->attn_qkv_b != nullptr) {
             b_attn_qkv.push_back(
                 getAttnQKVBias(meta, weights, layer, idev, ndev));
@@ -40,8 +137,6 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
         w_ffn_down.push_back(
             getFFNDown(meta, weights, layer, idev, ndev));
     }
-
-    auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
 
     *rsrc = DeviceResource{
         device,

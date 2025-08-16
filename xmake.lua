@@ -15,7 +15,21 @@ target("infinicore_infer")
     add_files("src/models/*/*.cpp")
     add_files("src/tensor/*.cpp")
     add_files("src/allocator/*.cpp")
+    add_files("src/quantization/*.cpp")
     add_includedirs("include")
+
+    -- 添加CUDA支持（如果可用）
+    if os.getenv("CUDA_PATH") or has_config("cuda") then
+        add_files("src/quantization/*.cu")
+        add_includedirs("/usr/local/cuda/include")
+        add_linkdirs("/usr/local/cuda/lib64")
+        add_links("cuda", "cudart", "cublas")
+        set_languages("cxx17", "cuda")
+        add_defines("CUDA_ENABLED")
+        -- 修复CUDA编译标志
+        add_cuflags("-arch=sm_75", "-std=c++17", {force = true})
+        set_policy("check.auto_ignore_flags", false)
+    end
 
     set_installdir(INFINI_ROOT)
     add_installfiles("include/infinicore_infer.h", {prefixdir = "include"})
