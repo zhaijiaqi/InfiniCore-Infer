@@ -6,6 +6,7 @@
 #include "infinicore_infer.h"
 #include "../../quantization/awq_gemm.hpp"
 #include "../../quantization/awq_quantization_params.hpp"
+#include "../../3rdparty/InfiniCore/include/infiniop/ops/quantize.h"
 
 #include <random>
 #include <thread>
@@ -211,7 +212,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                       const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
-                      uint32_t *output) {
+                      uint32_t *output, bool enable_quantization, const QuantizationParams &quant_params) {
     auto nlayer = meta.nlayer;
     auto nkvh = meta.nkvh / ndev;
     auto nh = meta.nh / ndev;
@@ -224,6 +225,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     auto dvoc = meta.dvoc;
     auto stream = rsrc.stream;
     bool has_qkv_bias = rsrc.b_attn_qkv.size() > 0;
+    // bool use_awq = enable_quantization;
 
     // Allocate buffers
     auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
@@ -269,6 +271,11 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         meta.epsilon));
     RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_norm, &workspace_size));
     workspace_size = std::max(workspace_size, temp_size);
+    infiniopQuantizeDescriptor_t desc_quant;
+    RUN_INFINI(infiniopCreateQuantizeDescriptor(
+        rsrc.handle, &desc_quant, logits_in->desc(), logits_out->desc()));
+    RUN_INFINI(infiniopGetQuantizeWorkspaceSize(desc_quant, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
     // Attention
     infiniopGemmDescriptor_t desc_attn_qkv, desc_attn_o;
     infiniopRearrangeDescriptor_t desc_qkv_bias;
@@ -277,6 +284,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             rsrc.handle, &desc_qkv_bias, qkv_buf->desc(),
             TensorDesc::create(dt_logits, {ntok, (nh + nkvh * 2) * dh}, {0, 1})->desc()));
     }
+    // TODO: modify Descriptor when use awq
     RUN_INFINI(infiniopCreateGemmDescriptor(
         rsrc.handle, &desc_attn_qkv, qkv_buf->desc(),
         logits_in->desc(), rsrc.w_attn_qkv[0]->desc()));
@@ -429,6 +437,11 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                 desc_qkv_bias,
                 qkv_buf->data(), rsrc.b_attn_qkv[layer]->data(), stream));
         }
+        // TODO: quant
+        RUN_INFINI(infiniopQuantize(
+            desc_quant, workspace, workspace_size,
+            logits_in->data(), logits_out->data(), stream));
+
         RUN_INFINI(infiniopGemm(
             desc_attn_qkv, workspace, workspace_size,
             qkv_buf->data(), logits_out->data(),
@@ -569,6 +582,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
 
     // Clean up
     infiniopDestroyRMSNormDescriptor(desc_norm);
+    infiniopDestroyQuantizeDescriptor(desc_quant);
     if (has_qkv_bias) {
         infiniopDestroyRearrangeDescriptor(desc_qkv_bias);
     }
@@ -635,6 +649,10 @@ void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceReso
         state.cv_load.notify_one();
     }
 
+    QuantizationParams quant_params;
+    if (enable_quantization)
+        quant_params = preloadQuantizationParams(meta, *rsrc, meta.nlayer, enable_quantization);
+
     // Infer Loop
     while (true) {
         std::unique_lock<std::mutex> lock(state.mtx);
@@ -644,7 +662,7 @@ void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceReso
             break;
         }
 
-        inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.temperature, req.topk, req.topp, req.output);
+        inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.temperature, req.topk, req.topp, req.output, enable_quantization, quant_params);
 
         state.proceed = false;
         lock.unlock();
